@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-mkv-parser"
+version = "0.1.0"
+description = "Sparse MKV track extraction — reads only wanted track data, skipping video payloads via lseek"
+requires-python = ">=3.10"
+license = "MIT"
+
+[project.scripts]
+fast-mkv-parser = "fast_mkv_parser.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
