@@ -1,0 +1,601 @@
+"""Tests for two-phase batched I/O extraction.
+
+Covers:
+- _merge_regions logic (gap merging, region splitting)
+- _split_region helper
+- End-to-end: batched vs single-pass produces byte-identical output
+"""
+
+import io
+import struct
+import tempfile
+import os
+
+import pytest
+
+from fast_mkv_parser.ebml import (
+    encode_element_id,
+    encode_element_size,
+    encode_vint_value,
+    UNKNOWN_SIZE,
+)
+from fast_mkv_parser import matroska as mkv
+from fast_mkv_parser.extractor import (
+    BlockPlan,
+    ReadRegion,
+    MkvParser,
+    _split_region,
+    _MAX_REGION_READ,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers to construct synthetic MKV data
+# ---------------------------------------------------------------------------
+
+def _make_uint_element(eid: int, value: int) -> bytes:
+    if value == 0:
+        payload = b"\x00"
+    else:
+        byte_len = (value.bit_length() + 7) // 8
+        payload = value.to_bytes(byte_len, "big")
+    return encode_element_id(eid) + encode_element_size(len(payload)) + payload
+
+
+def _make_string_element(eid: int, value: str) -> bytes:
+    payload = value.encode("utf-8")
+    return encode_element_id(eid) + encode_element_size(len(payload)) + payload
+
+
+def _make_track_entry_body(number: int, type_id: int, codec_id: str,
+                           language: str = "eng", uid: int = 12345) -> bytes:
+    body = b""
+    body += _make_uint_element(mkv.TRACK_NUMBER, number)
+    body += _make_uint_element(mkv.TRACK_UID, uid)
+    body += _make_uint_element(mkv.TRACK_TYPE, type_id)
+    body += _make_string_element(mkv.CODEC_ID, codec_id)
+    body += _make_string_element(mkv.LANGUAGE, language)
+    return body
+
+
+def _make_simple_block(track: int, rel_ts: int, flags: int, payload: bytes) -> bytes:
+    """Build a SimpleBlock body (track VINT + timestamp + flags + payload)."""
+    body = encode_vint_value(track) + struct.pack(">h", rel_ts) + bytes([flags]) + payload
+    return body
+
+
+def _make_block_group(track: int, rel_ts: int, flags: int, payload: bytes,
+                      duration: int = None) -> bytes:
+    """Build a BlockGroup body containing a Block element and optional BlockDuration."""
+    # Block element
+    block_body = encode_vint_value(track) + struct.pack(">h", rel_ts) + bytes([flags]) + payload
+    block_elem = (
+        encode_element_id(mkv.BLOCK)
+        + encode_element_size(len(block_body))
+        + block_body
+    )
+    group_body = block_elem
+    if duration is not None:
+        group_body += _make_uint_element(mkv.BLOCK_DURATION, duration)
+    return group_body
+
+
+def _make_cluster(timestamp: int, blocks: list) -> bytes:
+    """Build a Cluster element.
+
+    *blocks* is a list of (element_id, body_bytes) tuples — either
+    (SIMPLE_BLOCK, body) or (BLOCK_GROUP, body).
+    """
+    body = _make_uint_element(mkv.CLUSTER_TIMESTAMP, timestamp)
+    for eid, block_body in blocks:
+        body += encode_element_id(eid) + encode_element_size(len(block_body)) + block_body
+    return encode_element_id(mkv.CLUSTER) + encode_element_size(len(body)) + body
+
+
+def _make_minimal_mkv(
+    tracks: list,
+    clusters_bytes: bytes,
+    timecode_scale: int = 1_000_000,
+) -> bytes:
+    """Build a minimal MKV file with EBML Header + Segment.
+
+    *tracks* is a list of (number, type_id, codec_id) tuples.
+    *clusters_bytes* is pre-built Cluster element bytes.
+    """
+    # EBML Header
+    ebml_body = b""
+    ebml_body += _make_uint_element(0x4286, 1)      # EBMLVersion
+    ebml_body += _make_uint_element(0x42F7, 1)      # EBMLReadVersion
+    ebml_body += _make_uint_element(0x42F2, 4)      # EBMLMaxIDLength
+    ebml_body += _make_uint_element(0x42F3, 8)      # EBMLMaxSizeLength
+    ebml_body += _make_string_element(0x4282, "matroska")  # DocType
+    ebml_body += _make_uint_element(0x4287, 4)      # DocTypeVersion
+    ebml_body += _make_uint_element(0x4285, 2)      # DocTypeReadVersion
+    ebml_header = (
+        encode_element_id(mkv.EBML_HEADER)
+        + encode_element_size(len(ebml_body))
+        + ebml_body
+    )
+
+    # SegmentInfo
+    seg_info_body = _make_uint_element(mkv.TIMECODE_SCALE, timecode_scale)
+    seg_info = (
+        encode_element_id(mkv.SEGMENT_INFO)
+        + encode_element_size(len(seg_info_body))
+        + seg_info_body
+    )
+
+    # Tracks
+    tracks_body = b""
+    for num, type_id, codec_id in tracks:
+        entry_body = _make_track_entry_body(num, type_id, codec_id, uid=num * 1000)
+        tracks_body += (
+            encode_element_id(mkv.TRACK_ENTRY)
+            + encode_element_size(len(entry_body))
+            + entry_body
+        )
+    tracks_elem = (
+        encode_element_id(mkv.TRACKS)
+        + encode_element_size(len(tracks_body))
+        + tracks_body
+    )
+
+    # Segment (unknown size)
+    segment_payload = seg_info + tracks_elem + clusters_bytes
+    segment = (
+        encode_element_id(mkv.SEGMENT)
+        + encode_element_size(UNKNOWN_SIZE, width=8)
+        + segment_payload
+    )
+
+    return ebml_header + segment
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _merge_regions
+# ---------------------------------------------------------------------------
+
+class TestMergeRegions:
+    """Test the static _merge_regions method."""
+
+    def test_empty_plan(self):
+        assert MkvParser._merge_regions([]) == []
+
+    def test_single_block(self):
+        bp = BlockPlan(
+            file_offset=1000, size=500, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        regions = MkvParser._merge_regions([bp])
+        assert len(regions) == 1
+        assert regions[0].offset == 1000
+        assert regions[0].length == 500
+        assert regions[0].blocks == [bp]
+
+    def test_adjacent_blocks_merged(self):
+        """Two blocks within gap_threshold should be merged."""
+        bp1 = BlockPlan(
+            file_offset=1000, size=100, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        bp2 = BlockPlan(
+            file_offset=1200, size=100, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        regions = MkvParser._merge_regions([bp1, bp2], gap_threshold=200)
+        assert len(regions) == 1
+        assert regions[0].offset == 1000
+        assert regions[0].length == 300  # 1200 + 100 - 1000
+        assert len(regions[0].blocks) == 2
+
+    def test_distant_blocks_separate(self):
+        """Two blocks with a gap exceeding threshold should be separate regions."""
+        bp1 = BlockPlan(
+            file_offset=1000, size=100, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        bp2 = BlockPlan(
+            file_offset=200_000, size=100, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        regions = MkvParser._merge_regions([bp1, bp2], gap_threshold=1000)
+        assert len(regions) == 2
+        assert regions[0].offset == 1000
+        assert regions[0].length == 100
+        assert regions[1].offset == 200_000
+        assert regions[1].length == 100
+
+    def test_three_blocks_partial_merge(self):
+        """Blocks 1 and 2 merge, block 3 is separate."""
+        bp1 = BlockPlan(
+            file_offset=100, size=50, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        bp2 = BlockPlan(
+            file_offset=200, size=50, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        bp3 = BlockPlan(
+            file_offset=100_000, size=50, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        regions = MkvParser._merge_regions([bp1, bp2, bp3], gap_threshold=200)
+        assert len(regions) == 2
+        assert len(regions[0].blocks) == 2
+        assert len(regions[1].blocks) == 1
+
+    def test_zero_gap_threshold(self):
+        """With gap_threshold=0, only truly overlapping/contiguous blocks merge."""
+        bp1 = BlockPlan(
+            file_offset=100, size=50, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        bp2 = BlockPlan(
+            file_offset=150, size=50, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        bp3 = BlockPlan(
+            file_offset=201, size=50, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        regions = MkvParser._merge_regions([bp1, bp2, bp3], gap_threshold=0)
+        assert len(regions) == 2
+        # bp1 and bp2 are contiguous (gap = 150 - (100+50) = 0)
+        assert regions[0].length == 100
+        assert len(regions[0].blocks) == 2
+
+
+class TestSplitRegion:
+    """Test the _split_region helper."""
+
+    def test_small_region_not_split(self):
+        bp = BlockPlan(
+            file_offset=0, size=1000, track_number=2,
+            cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+            is_simple_block=True,
+        )
+        regions = _split_region(0, 1000, [bp])
+        assert len(regions) == 1
+
+    def test_large_region_split(self):
+        """A region exceeding _MAX_REGION_READ should be split."""
+        blocks = []
+        for i in range(32):
+            blocks.append(BlockPlan(
+                file_offset=i * 1_000_000,
+                size=500_000,
+                track_number=2,
+                cluster_ts=0, rel_ts=0, flags=0, hdr_size=4,
+                is_simple_block=True,
+            ))
+        total_length = blocks[-1].file_offset + blocks[-1].size - blocks[0].file_offset
+        regions = _split_region(blocks[0].file_offset, total_length, blocks)
+
+        # Should be split into multiple regions
+        assert len(regions) > 1
+        # Every region should be <= _MAX_REGION_READ
+        for r in regions:
+            assert r.length <= _MAX_REGION_READ
+        # All blocks should be accounted for
+        all_blocks = []
+        for r in regions:
+            all_blocks.extend(r.blocks)
+        assert len(all_blocks) == 32
+
+
+# ---------------------------------------------------------------------------
+# Integration test: batched vs single-pass byte-identical output
+# ---------------------------------------------------------------------------
+
+class TestBatchedVsSinglePass:
+    """End-to-end tests: both strategies must produce identical output."""
+
+    def _build_test_mkv(self) -> bytes:
+        """Build a small MKV with video (track 1), audio (track 2), subtitle (track 5)."""
+        clusters = b""
+        for cluster_ts in range(0, 3000, 1000):
+            blocks = []
+            # Video blocks (track 1) — large payload, will be skipped
+            for i in range(5):
+                video_payload = bytes(range(256)) * 4  # 1024 bytes
+                sb = _make_simple_block(1, i * 40, 0x80, video_payload)
+                blocks.append((mkv.SIMPLE_BLOCK, sb))
+            # Audio blocks (track 2) — small payload
+            for i in range(3):
+                audio_payload = bytes([0xAA, 0xBB, 0xCC] * 20)  # 60 bytes
+                sb = _make_simple_block(2, i * 30, 0x80, audio_payload)
+                blocks.append((mkv.SIMPLE_BLOCK, sb))
+            # Subtitle block (track 5) as BlockGroup
+            sub_payload = bytes([0x16, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF])  # PGS-like
+            bg = _make_block_group(5, 0, 0x00, sub_payload, duration=1000)
+            blocks.append((mkv.BLOCK_GROUP, bg))
+
+            clusters += _make_cluster(cluster_ts, blocks)
+
+        tracks = [
+            (1, mkv.TRACK_TYPE_VIDEO, "V_MPEGH/ISO/HEVC"),
+            (2, mkv.TRACK_TYPE_AUDIO, "A_TRUEHD"),
+            (5, mkv.TRACK_TYPE_SUBTITLE, "S_HDMV/PGS"),
+        ]
+        return _make_minimal_mkv(tracks, clusters)
+
+    def test_mkv_audio_extraction_identical(self):
+        """Extracting audio via batched and single-pass should be byte-identical."""
+        mkv_data = self._build_test_mkv()
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+            assert len(parser.tracks) == 3
+
+            # Single-pass extraction
+            with tempfile.NamedTemporaryFile(suffix=".mka", delete=False) as f:
+                single_path = f.name
+            parser.extract(
+                track_types=["audio"],
+                output=single_path,
+                format="mkv",
+                strategy="single-pass",
+            )
+
+            # Batched extraction
+            with tempfile.NamedTemporaryFile(suffix=".mka", delete=False) as f:
+                batched_path = f.name
+            parser.extract(
+                track_types=["audio"],
+                output=batched_path,
+                format="mkv",
+                strategy="batched",
+            )
+
+            with open(single_path, "rb") as a, open(batched_path, "rb") as b:
+                single_data = a.read()
+                batched_data = b.read()
+
+            assert len(single_data) > 0
+            assert single_data == batched_data
+        finally:
+            os.unlink(src_path)
+            os.unlink(single_path)
+            os.unlink(batched_path)
+
+    def test_mkv_subtitle_extraction_identical(self):
+        """Extracting subtitles via batched and single-pass should be byte-identical."""
+        mkv_data = self._build_test_mkv()
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+
+            # Single-pass
+            with tempfile.NamedTemporaryFile(suffix=".mks", delete=False) as f:
+                single_path = f.name
+            parser.extract(
+                track_types=["subtitle"],
+                output=single_path,
+                format="mkv",
+                strategy="single-pass",
+            )
+
+            # Batched
+            with tempfile.NamedTemporaryFile(suffix=".mks", delete=False) as f:
+                batched_path = f.name
+            parser.extract(
+                track_types=["subtitle"],
+                output=batched_path,
+                format="mkv",
+                strategy="batched",
+            )
+
+            with open(single_path, "rb") as a, open(batched_path, "rb") as b:
+                assert a.read() == b.read()
+        finally:
+            os.unlink(src_path)
+            os.unlink(single_path)
+            os.unlink(batched_path)
+
+    def test_sup_extraction_identical(self):
+        """Extracting PGS subtitles as SUP via both strategies should be identical."""
+        mkv_data = self._build_test_mkv()
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+
+            # Single-pass
+            with tempfile.NamedTemporaryFile(suffix=".sup", delete=False) as f:
+                single_path = f.name
+            parser.extract(
+                track_types=["subtitle"],
+                output=single_path,
+                format="sup",
+                strategy="single-pass",
+            )
+
+            # Batched
+            with tempfile.NamedTemporaryFile(suffix=".sup", delete=False) as f:
+                batched_path = f.name
+            parser.extract(
+                track_types=["subtitle"],
+                output=batched_path,
+                format="sup",
+                strategy="batched",
+            )
+
+            with open(single_path, "rb") as a, open(batched_path, "rb") as b:
+                single_data = a.read()
+                batched_data = b.read()
+
+            assert len(single_data) > 0
+            assert single_data == batched_data
+        finally:
+            os.unlink(src_path)
+            os.unlink(single_path)
+            os.unlink(batched_path)
+
+    def test_multi_track_extraction_identical(self):
+        """Extracting audio+subtitle via both strategies should be byte-identical."""
+        mkv_data = self._build_test_mkv()
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+
+            # Single-pass (default: all non-video)
+            with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+                single_path = f.name
+            parser.extract(
+                output=single_path,
+                format="mkv",
+                strategy="single-pass",
+            )
+
+            # Batched
+            with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+                batched_path = f.name
+            parser.extract(
+                output=batched_path,
+                format="mkv",
+                strategy="batched",
+            )
+
+            with open(single_path, "rb") as a, open(batched_path, "rb") as b:
+                assert a.read() == b.read()
+        finally:
+            os.unlink(src_path)
+            os.unlink(single_path)
+            os.unlink(batched_path)
+
+    def test_auto_strategy_selects_single_pass_for_small_files(self):
+        """auto strategy should use single-pass for files < 1 GB (our test files)."""
+        mkv_data = self._build_test_mkv()
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+            assert parser._file_size < 1_000_000_000
+
+            # auto and single-pass should produce identical output
+            with tempfile.NamedTemporaryFile(suffix=".mka", delete=False) as f:
+                auto_path = f.name
+            with tempfile.NamedTemporaryFile(suffix=".mka", delete=False) as f:
+                sp_path = f.name
+
+            parser.extract(
+                track_types=["audio"], output=auto_path, format="mkv",
+                strategy="auto",
+            )
+            parser.extract(
+                track_types=["audio"], output=sp_path, format="mkv",
+                strategy="single-pass",
+            )
+
+            with open(auto_path, "rb") as a, open(sp_path, "rb") as b:
+                assert a.read() == b.read()
+        finally:
+            os.unlink(src_path)
+            os.unlink(auto_path)
+            os.unlink(sp_path)
+
+
+class TestScanBlocks:
+    """Test Phase 1 scan produces correct BlockPlan entries."""
+
+    def _build_and_parse(self):
+        """Build test MKV and return (parser, src_path)."""
+        clusters = b""
+        # Cluster at ts=0: 2 video (track 1), 1 audio (track 2)
+        blocks = [
+            (mkv.SIMPLE_BLOCK, _make_simple_block(1, 0, 0x80, b"\x00" * 100)),
+            (mkv.SIMPLE_BLOCK, _make_simple_block(2, 0, 0x80, b"\xAA" * 20)),
+            (mkv.SIMPLE_BLOCK, _make_simple_block(1, 40, 0x00, b"\x00" * 100)),
+        ]
+        clusters += _make_cluster(0, blocks)
+
+        # Cluster at ts=1000: 1 video, 1 audio
+        blocks = [
+            (mkv.SIMPLE_BLOCK, _make_simple_block(1, 0, 0x80, b"\x00" * 100)),
+            (mkv.SIMPLE_BLOCK, _make_simple_block(2, 0, 0x80, b"\xBB" * 20)),
+        ]
+        clusters += _make_cluster(1000, blocks)
+
+        tracks = [
+            (1, mkv.TRACK_TYPE_VIDEO, "V_MPEGH/ISO/HEVC"),
+            (2, mkv.TRACK_TYPE_AUDIO, "A_TRUEHD"),
+        ]
+        mkv_data = _make_minimal_mkv(tracks, clusters)
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            path = f.name
+        return MkvParser(path), path
+
+    def test_scan_filters_to_wanted_tracks(self):
+        parser, path = self._build_and_parse()
+        try:
+            with open(path, "rb") as src:
+                plan = parser._scan_blocks(src, {2})  # only audio
+
+            # Should have exactly 2 audio blocks
+            assert len(plan) == 2
+            assert all(bp.track_number == 2 for bp in plan)
+            assert plan[0].cluster_ts == 0
+            assert plan[1].cluster_ts == 1000
+        finally:
+            os.unlink(path)
+
+    def test_scan_preserves_file_order(self):
+        parser, path = self._build_and_parse()
+        try:
+            with open(path, "rb") as src:
+                plan = parser._scan_blocks(src, {1, 2})  # all tracks
+
+            # Should be in file offset order
+            offsets = [bp.file_offset for bp in plan]
+            assert offsets == sorted(offsets)
+            # 5 total blocks: 3 in cluster 0, 2 in cluster 1
+            assert len(plan) == 5
+        finally:
+            os.unlink(path)
+
+    def test_scan_records_correct_metadata(self):
+        parser, path = self._build_and_parse()
+        try:
+            with open(path, "rb") as src:
+                plan = parser._scan_blocks(src, {2})
+
+            bp = plan[0]
+            assert bp.track_number == 2
+            assert bp.cluster_ts == 0
+            assert bp.rel_ts == 0
+            assert bp.is_simple_block is True
+            assert bp.hdr_size == 4  # track VINT(1) + ts(2) + flags(1)
+            assert bp.size > bp.hdr_size  # has payload beyond header
+        finally:
+            os.unlink(path)

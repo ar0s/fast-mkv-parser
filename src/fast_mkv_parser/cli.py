@@ -112,6 +112,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         output=args.output,
         format=fmt,
         progress_callback=cb,
+        strategy=args.strategy,
     )
 
     elapsed = time.monotonic() - start_time
@@ -156,6 +157,14 @@ def main() -> None:
         "--progress",
         action="store_true",
         help="Show progress bar",
+    )
+    ext_p.add_argument(
+        "--strategy",
+        choices=["auto", "batched", "single-pass"],
+        default="auto",
+        help="Extraction strategy: auto (batched for >1 GB, single-pass otherwise), "
+             "batched (two-phase scan+fetch, optimized for NFS), "
+             "single-pass (original interleaved read/skip). Default: auto.",
     )
 
     args = parser.parse_args()

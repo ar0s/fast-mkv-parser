@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import struct
 import sys
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import BinaryIO, Callable, Dict, List, Optional, Set, Tuple
 
@@ -32,7 +33,32 @@ from .writers import MkvWriter, SupWriter
 
 # posix_fadvise constants (may not be available on all platforms).
 _FADV_RANDOM = getattr(os, "POSIX_FADV_RANDOM", 1)
+_FADV_SEQUENTIAL = getattr(os, "POSIX_FADV_SEQUENTIAL", 2)
 _HAS_FADVISE = hasattr(os, "posix_fadvise")
+
+# Maximum size of a single merged region read (16 MB).
+_MAX_REGION_READ = 16 * 1024 * 1024
+
+
+@dataclass
+class BlockPlan:
+    """One block to be extracted, discovered during Phase 1 header scan."""
+    file_offset: int      # Absolute offset of block body in source file
+    size: int             # Block body size in bytes
+    track_number: int     # Track number (from block header)
+    cluster_ts: int       # Cluster timestamp for this block
+    rel_ts: int           # Block-relative timestamp (signed int16)
+    flags: int            # Block flags (keyframe etc.)
+    hdr_size: int         # Size of block header within body (track + ts + flags)
+    is_simple_block: bool # SimpleBlock vs BlockGroup
+
+
+@dataclass
+class ReadRegion:
+    """A merged contiguous region to read from the source file."""
+    offset: int
+    length: int
+    blocks: List[BlockPlan] = field(default_factory=list)
 
 
 def _open_for_sparse_read(path: str) -> BinaryIO:
@@ -48,6 +74,49 @@ def _open_for_sparse_read(path: str) -> BinaryIO:
         except OSError:
             pass  # Not all filesystems support fadvise; proceed anyway.
     return os.fdopen(fd, "rb", buffering=8192)
+
+
+def _split_region(
+    offset: int, length: int, blocks: List[BlockPlan]
+) -> List[ReadRegion]:
+    """Split a merged region into sub-regions if it exceeds _MAX_REGION_READ.
+
+    Each sub-region contains the blocks whose file_offset falls within it.
+    Sub-region boundaries are chosen so that no block is split across regions.
+    """
+    if length <= _MAX_REGION_READ:
+        return [ReadRegion(offset=offset, length=length, blocks=blocks)]
+
+    regions: List[ReadRegion] = []
+    sub_start = offset
+    sub_blocks: List[BlockPlan] = []
+
+    for bp in blocks:
+        bp_end = bp.file_offset + bp.size
+        # Would adding this block push the sub-region over the limit?
+        if sub_blocks and (bp_end - sub_start) > _MAX_REGION_READ:
+            # Finalize current sub-region up to the end of the last block.
+            last_end = sub_blocks[-1].file_offset + sub_blocks[-1].size
+            regions.append(ReadRegion(
+                offset=sub_start,
+                length=last_end - sub_start,
+                blocks=sub_blocks,
+            ))
+            sub_start = bp.file_offset
+            sub_blocks = [bp]
+        else:
+            sub_blocks.append(bp)
+
+    # Finalize last sub-region.
+    if sub_blocks:
+        last_end = sub_blocks[-1].file_offset + sub_blocks[-1].size
+        regions.append(ReadRegion(
+            offset=sub_start,
+            length=last_end - sub_start,
+            blocks=sub_blocks,
+        ))
+
+    return regions
 
 
 class MkvParser:
@@ -91,6 +160,7 @@ class MkvParser:
         output: str = "output.mkv",
         format: str = "mkv",
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        strategy: str = "auto",
     ) -> None:
         """Extract selected tracks to *output* file.
 
@@ -101,6 +171,10 @@ class MkvParser:
             output: Output file path.
             format: Output format: "mkv" (Matroska container) or "sup" (PGS SUP).
             progress_callback: Called with (bytes_processed, total_file_size).
+            strategy: Extraction strategy:
+                "auto" — batched for files >1 GB, single-pass otherwise.
+                "batched" — two-phase scan+fetch (optimized for NFS).
+                "single-pass" — original interleaved read/skip.
         """
         wanted = self._resolve_wanted_tracks(track_numbers, track_types)
         if not wanted:
@@ -113,7 +187,21 @@ class MkvParser:
                 writer = MkvWriter(dst)
                 self._write_mkv_header(writer, wanted)
 
-            self._walk_clusters(src, writer, wanted, format, progress_callback)
+            if strategy == "auto":
+                use_batched = self._file_size > 1_000_000_000  # >1 GB
+            else:
+                use_batched = strategy == "batched"
+
+            if use_batched:
+                plan = self._scan_blocks(src, wanted)
+                regions = self._merge_regions(plan)
+                self._fetch_regions(
+                    src, regions, writer, format, progress_callback
+                )
+            else:
+                self._walk_clusters(
+                    src, writer, wanted, format, progress_callback
+                )
 
             writer.finalize()
 
@@ -422,6 +510,248 @@ class MkvParser:
                 writer.begin_cluster(cluster_ts)
             writer.write_block_group(group_body)
         return True
+
+    # ------------------------------------------------------------------
+    # Batched I/O: two-phase extraction for NFS performance
+    # ------------------------------------------------------------------
+
+    def _scan_blocks(self, src: BinaryIO, wanted: Set[int]) -> List[BlockPlan]:
+        """Phase 1: Scan all Clusters, recording metadata for wanted blocks.
+
+        Uses FADV_SEQUENTIAL for efficient NFS read-ahead during the scan.
+        Does NOT read block payloads — only element headers + track numbers.
+        """
+        plan: List[BlockPlan] = []
+        src.seek(self._layout.first_cluster_offset)
+
+        # Switch to sequential read-ahead for the scan phase.
+        if _HAS_FADVISE:
+            try:
+                fd = src.fileno()
+                os.posix_fadvise(fd, self._layout.first_cluster_offset, 0,
+                                 _FADV_SEQUENTIAL)
+            except OSError:
+                pass
+
+        while src.tell() < self._file_size:
+            try:
+                elem_pos = src.tell()
+                eid, _ = read_element_id(src)
+                esize, _ = read_element_size(src)
+            except EOFError:
+                break
+
+            if eid != mkv.CLUSTER:
+                if esize == UNKNOWN_SIZE:
+                    break
+                src.seek(src.tell() + esize)
+                continue
+
+            cluster_body_start = src.tell()
+            cluster_end = (
+                cluster_body_start + esize if esize != UNKNOWN_SIZE
+                else self._file_size
+            )
+            cluster_ts = 0
+
+            while src.tell() < cluster_end:
+                try:
+                    child_pos = src.tell()
+                    child_id, _ = read_element_id(src)
+                    child_size, _ = read_element_size(src)
+                except EOFError:
+                    break
+
+                child_body_pos = src.tell()
+
+                if child_id == mkv.CLUSTER_TIMESTAMP:
+                    cluster_ts = mkv._read_uint(src, child_size)
+                    continue
+
+                if child_id == mkv.SIMPLE_BLOCK:
+                    # Read just the header peek (track + ts + flags).
+                    header_peek = src.read(min(12, child_size))
+                    track_num, rel_ts, flags, hdr_size = mkv.parse_block_header(
+                        header_peek
+                    )
+
+                    if track_num in wanted:
+                        plan.append(BlockPlan(
+                            file_offset=child_body_pos,
+                            size=child_size,
+                            track_number=track_num,
+                            cluster_ts=cluster_ts,
+                            rel_ts=rel_ts,
+                            flags=flags,
+                            hdr_size=hdr_size,
+                            is_simple_block=True,
+                        ))
+
+                    # Skip remaining payload.
+                    remaining = child_size - len(header_peek)
+                    if remaining > 0:
+                        src.seek(remaining, 1)
+                    continue
+
+                if child_id == mkv.BLOCK_GROUP:
+                    group_end = child_body_pos + child_size
+                    track_num = None
+                    rel_ts = 0
+                    flags = 0
+                    hdr_size = 0
+
+                    # Scan children to find the Block element and its track number.
+                    while src.tell() < group_end:
+                        try:
+                            bgeid, _ = read_element_id(src)
+                            bgesize, _ = read_element_size(src)
+                        except EOFError:
+                            break
+
+                        if bgeid == mkv.BLOCK:
+                            header_peek = src.read(min(12, bgesize))
+                            track_num, rel_ts, flags, hdr_size = (
+                                mkv.parse_block_header(header_peek)
+                            )
+                            break
+                        else:
+                            if bgesize == UNKNOWN_SIZE:
+                                break
+                            src.seek(bgesize, 1)
+
+                    if track_num is not None and track_num in wanted:
+                        plan.append(BlockPlan(
+                            file_offset=child_body_pos,
+                            size=child_size,
+                            track_number=track_num,
+                            cluster_ts=cluster_ts,
+                            rel_ts=rel_ts,
+                            flags=flags,
+                            hdr_size=hdr_size,
+                            is_simple_block=False,
+                        ))
+
+                    src.seek(group_end)
+                    continue
+
+                if child_id == mkv.CLUSTER:
+                    # Encountered next Cluster inside unknown-size Cluster.
+                    src.seek(child_pos)
+                    break
+
+                # Unknown child — skip.
+                if child_size == UNKNOWN_SIZE:
+                    break
+                src.seek(child_body_pos + child_size)
+
+        return plan
+
+    @staticmethod
+    def _merge_regions(
+        plan: List[BlockPlan],
+        gap_threshold: int = 65536,
+    ) -> List[ReadRegion]:
+        """Merge adjacent wanted blocks into contiguous read regions.
+
+        If two blocks are within *gap_threshold* bytes of each other, they are
+        merged into one region.  This dramatically reduces NFS round trips for
+        audio tracks where blocks are close together in the file.
+
+        Regions exceeding ``_MAX_REGION_READ`` are split into sub-regions.
+        """
+        if not plan:
+            return []
+
+        # Plan is already in file-offset order (from sequential scan).
+        regions: List[ReadRegion] = []
+        cur_start = plan[0].file_offset
+        cur_end = plan[0].file_offset + plan[0].size
+        cur_blocks: List[BlockPlan] = [plan[0]]
+
+        for bp in plan[1:]:
+            bp_end = bp.file_offset + bp.size
+            if bp.file_offset - cur_end <= gap_threshold:
+                # Merge: extend current region.
+                cur_end = max(cur_end, bp_end)
+                cur_blocks.append(bp)
+            else:
+                # Gap too large: finalize current region, start new one.
+                regions.extend(
+                    _split_region(cur_start, cur_end - cur_start, cur_blocks)
+                )
+                cur_start = bp.file_offset
+                cur_end = bp_end
+                cur_blocks = [bp]
+
+        # Finalize last region.
+        regions.extend(_split_region(cur_start, cur_end - cur_start, cur_blocks))
+        return regions
+
+    def _fetch_regions(
+        self,
+        src: BinaryIO,
+        regions: List[ReadRegion],
+        writer,
+        format: str,
+        progress_callback: Optional[Callable],
+    ) -> None:
+        """Phase 2: Read merged regions sequentially and write wanted blocks."""
+        # Switch to sequential read-ahead for payload fetch.
+        if _HAS_FADVISE:
+            try:
+                fd = src.fileno()
+                os.posix_fadvise(fd, 0, 0, _FADV_SEQUENTIAL)
+            except OSError:
+                pass
+
+        prev_cluster_ts = None
+
+        for region in regions:
+            src.seek(region.offset)
+            region_data = src.read(region.length)
+
+            for bp in region.blocks:
+                # Extract this block's data from the region buffer.
+                local_offset = bp.file_offset - region.offset
+                block_data = region_data[local_offset : local_offset + bp.size]
+
+                if format == "sup":
+                    if bp.is_simple_block:
+                        writer.write_block(
+                            bp.cluster_ts, bp.rel_ts, block_data[bp.hdr_size:]
+                        )
+                    else:
+                        # BlockGroup: scan the in-memory body to find the Block
+                        # element, then extract its payload (matches single-pass
+                        # _handle_block_group SUP logic).
+                        gf = BytesIO(block_data)
+                        while gf.tell() < len(block_data):
+                            try:
+                                geid, _ = read_element_id(gf)
+                                gesize, _ = read_element_size(gf)
+                            except EOFError:
+                                break
+                            if geid == mkv.BLOCK:
+                                inner = gf.read(gesize)
+                                _, _, _, bhs = mkv.parse_block_header(inner)
+                                writer.write_block(
+                                    bp.cluster_ts, bp.rel_ts, inner[bhs:]
+                                )
+                                break
+                            else:
+                                gf.seek(gesize, 1)
+                else:
+                    if bp.cluster_ts != prev_cluster_ts:
+                        writer.begin_cluster(bp.cluster_ts)
+                        prev_cluster_ts = bp.cluster_ts
+
+                    if bp.is_simple_block:
+                        writer.write_simple_block(block_data)
+                    else:
+                        writer.write_block_group(block_data)
+
+            if progress_callback:
+                progress_callback(region.offset + region.length, self._file_size)
 
     # ------------------------------------------------------------------
     # Helpers
