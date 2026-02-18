@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import struct
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import BinaryIO, Callable, Dict, List, Optional, Set, Tuple
@@ -119,6 +120,150 @@ def _split_region(
     return regions
 
 
+def _scan_block_range(
+    path: str,
+    start_offset: int,
+    end_offset: int,
+    wanted: Set[int],
+) -> List[BlockPlan]:
+    """Scan blocks in [start_offset, end_offset) of an MKV file.
+
+    Opens its own file descriptor with FADV_RANDOM.  Returns BlockPlan
+    entries for wanted tracks, in file-offset order.
+
+    Designed for ThreadPoolExecutor: module-level, no shared state.
+    """
+    plan: List[BlockPlan] = []
+    fd = os.open(path, os.O_RDONLY)
+    if _HAS_FADVISE:
+        try:
+            length = end_offset - start_offset
+            os.posix_fadvise(fd, start_offset, length, _FADV_RANDOM)
+        except OSError:
+            pass
+    src = os.fdopen(fd, "rb", buffering=8192)
+    try:
+        src.seek(start_offset)
+
+        # Scan for Cluster elements in our range.
+        while src.tell() < end_offset:
+            try:
+                elem_pos = src.tell()
+                eid, _ = read_element_id(src)
+                esize, _ = read_element_size(src)
+            except EOFError:
+                break
+
+            if eid != mkv.CLUSTER:
+                # Non-Cluster Level 1 element — skip it.
+                if esize == UNKNOWN_SIZE:
+                    break
+                src.seek(src.tell() + esize)
+                continue
+
+            # Parse Cluster children.
+            cluster_body_start = src.tell()
+            cluster_end = (
+                cluster_body_start + esize if esize != UNKNOWN_SIZE
+                else end_offset
+            )
+            # Don't scan past our assigned range.
+            cluster_end = min(cluster_end, end_offset)
+            cluster_ts = 0
+
+            while src.tell() < cluster_end:
+                try:
+                    child_pos = src.tell()
+                    child_id, _ = read_element_id(src)
+                    child_size, _ = read_element_size(src)
+                except EOFError:
+                    break
+
+                child_body_pos = src.tell()
+
+                if child_id == mkv.CLUSTER_TIMESTAMP:
+                    cluster_ts = mkv._read_uint(src, child_size)
+                    continue
+
+                if child_id == mkv.SIMPLE_BLOCK:
+                    header_peek = src.read(min(12, child_size))
+                    track_num, rel_ts, flags, hdr_size = mkv.parse_block_header(
+                        header_peek
+                    )
+
+                    if track_num in wanted:
+                        plan.append(BlockPlan(
+                            file_offset=child_body_pos,
+                            size=child_size,
+                            track_number=track_num,
+                            cluster_ts=cluster_ts,
+                            rel_ts=rel_ts,
+                            flags=flags,
+                            hdr_size=hdr_size,
+                            is_simple_block=True,
+                        ))
+
+                    remaining = child_size - len(header_peek)
+                    if remaining > 0:
+                        src.seek(remaining, 1)
+                    continue
+
+                if child_id == mkv.BLOCK_GROUP:
+                    group_end = child_body_pos + child_size
+                    track_num = None
+                    rel_ts = 0
+                    flags = 0
+                    hdr_size = 0
+
+                    while src.tell() < group_end:
+                        try:
+                            bgeid, _ = read_element_id(src)
+                            bgesize, _ = read_element_size(src)
+                        except EOFError:
+                            break
+
+                        if bgeid == mkv.BLOCK:
+                            header_peek = src.read(min(12, bgesize))
+                            track_num, rel_ts, flags, hdr_size = (
+                                mkv.parse_block_header(header_peek)
+                            )
+                            break
+                        else:
+                            if bgesize == UNKNOWN_SIZE:
+                                break
+                            src.seek(bgesize, 1)
+
+                    if track_num is not None and track_num in wanted:
+                        plan.append(BlockPlan(
+                            file_offset=child_body_pos,
+                            size=child_size,
+                            track_number=track_num,
+                            cluster_ts=cluster_ts,
+                            rel_ts=rel_ts,
+                            flags=flags,
+                            hdr_size=hdr_size,
+                            is_simple_block=False,
+                        ))
+
+                    src.seek(group_end)
+                    continue
+
+                if child_id == mkv.CLUSTER:
+                    # Encountered next Cluster inside unknown-size Cluster.
+                    src.seek(child_pos)
+                    break
+
+                # Unknown child — skip.
+                if child_size == UNKNOWN_SIZE:
+                    break
+                src.seek(child_body_pos + child_size)
+
+    finally:
+        src.close()
+
+    return plan
+
+
 class MkvParser:
     """Parse an MKV file and extract selected tracks with minimal I/O.
 
@@ -161,6 +306,7 @@ class MkvParser:
         format: str = "mkv",
         progress_callback: Optional[Callable[[int, int], None]] = None,
         strategy: str = "auto",
+        scan_workers: int = 0,
     ) -> None:
         """Extract selected tracks to *output* file.
 
@@ -175,33 +321,45 @@ class MkvParser:
                 "auto" — batched for files >1 GB, single-pass otherwise.
                 "batched" — two-phase scan+fetch (optimized for NFS).
                 "single-pass" — original interleaved read/skip.
+            scan_workers: Number of parallel Phase 1 scan workers.
+                0 = auto (4 for batched strategy, 1 otherwise).
+                1 = single-threaded.
         """
         wanted = self._resolve_wanted_tracks(track_numbers, track_types)
         if not wanted:
             raise ValueError("no matching tracks found for the given filter")
 
-        with _open_for_sparse_read(self.path) as src, open(output, "wb") as dst:
+        if strategy == "auto":
+            use_batched = self._file_size > 1_000_000_000  # >1 GB
+        else:
+            use_batched = strategy == "batched"
+
+        # Resolve worker count.
+        workers = scan_workers
+        if workers == 0:
+            workers = 4 if use_batched else 1
+
+        with open(output, "wb") as dst:
             if format == "sup":
                 writer = SupWriter(dst, timecode_scale_ns=self.timecode_scale)
             else:
                 writer = MkvWriter(dst)
                 self._write_mkv_header(writer, wanted)
 
-            if strategy == "auto":
-                use_batched = self._file_size > 1_000_000_000  # >1 GB
-            else:
-                use_batched = strategy == "batched"
-
             if use_batched:
-                plan = self._scan_blocks(src, wanted)
+                # Phase 1: scan (parallel or single-threaded).
+                plan = self._scan_blocks_parallel(wanted, n_workers=workers)
                 regions = self._merge_regions(plan)
-                self._fetch_regions(
-                    src, regions, writer, format, progress_callback
-                )
+                # Phase 2: fetch regions with a single fd.
+                with _open_for_sparse_read(self.path) as src:
+                    self._fetch_regions(
+                        src, regions, writer, format, progress_callback
+                    )
             else:
-                self._walk_clusters(
-                    src, writer, wanted, format, progress_callback
-                )
+                with _open_for_sparse_read(self.path) as src:
+                    self._walk_clusters(
+                        src, writer, wanted, format, progress_callback
+                    )
 
             writer.finalize()
 
@@ -524,12 +682,14 @@ class MkvParser:
         plan: List[BlockPlan] = []
         src.seek(self._layout.first_cluster_offset)
 
-        # Switch to sequential read-ahead for the scan phase.
+        # Use FADV_RANDOM to avoid wasted NFS read-ahead during header scan.
+        # Each header peek is ~12 bytes; FADV_SEQUENTIAL triggers 128KB+
+        # read-ahead that is discarded on the next seek (833:1 waste ratio).
         if _HAS_FADVISE:
             try:
                 fd = src.fileno()
                 os.posix_fadvise(fd, self._layout.first_cluster_offset, 0,
-                                 _FADV_SEQUENTIAL)
+                                 _FADV_RANDOM)
             except OSError:
                 pass
 
@@ -645,6 +805,102 @@ class MkvParser:
                 src.seek(child_body_pos + child_size)
 
         return plan
+
+    @staticmethod
+    def _build_scan_ranges(
+        cues: List[mkv.CueEntry],
+        segment_data_offset: int,
+        first_cluster_offset: int,
+        file_size: int,
+        n_workers: int,
+    ) -> List[Tuple[int, int]]:
+        """Partition the cluster region into N byte ranges using Cue positions.
+
+        Returns list of (start_offset, end_offset) tuples.  Ranges are
+        non-overlapping and cover the entire cluster region from
+        first_cluster_offset to file_size.
+        """
+        # Deduplicate cue cluster positions and convert to absolute offsets.
+        abs_offsets = sorted({
+            segment_data_offset + c.cluster_position for c in cues
+        })
+        # Filter to offsets within the cluster region.
+        abs_offsets = [o for o in abs_offsets if first_cluster_offset <= o < file_size]
+
+        if len(abs_offsets) < 2 or n_workers <= 1:
+            return [(first_cluster_offset, file_size)]
+
+        # Pick N-1 evenly-spaced split points by byte position.
+        total_span = abs_offsets[-1] - abs_offsets[0]
+        if total_span == 0:
+            return [(first_cluster_offset, file_size)]
+
+        ranges: List[Tuple[int, int]] = []
+        n = min(n_workers, len(abs_offsets))
+        chunk_size = total_span / n
+
+        prev_start = first_cluster_offset
+        for i in range(1, n):
+            target_byte = abs_offsets[0] + chunk_size * i
+            # Find the closest cue offset at or past the target.
+            best = abs_offsets[-1]
+            for o in abs_offsets:
+                if o >= target_byte:
+                    best = o
+                    break
+            if best <= prev_start:
+                continue
+            ranges.append((prev_start, best))
+            prev_start = best
+
+        # Final range to end of file.
+        ranges.append((prev_start, file_size))
+        return ranges
+
+    def _scan_blocks_parallel(
+        self,
+        wanted: Set[int],
+        n_workers: int = 4,
+    ) -> List[BlockPlan]:
+        """Phase 1 with parallel scanning using Cue-based range partitioning.
+
+        Falls back to single-threaded _scan_blocks() if no Cues available
+        or n_workers <= 1.
+        """
+        if n_workers <= 1 or not self._cues:
+            with _open_for_sparse_read(self.path) as src:
+                return self._scan_blocks(src, wanted)
+
+        ranges = self._build_scan_ranges(
+            self._cues,
+            self._layout.segment_data_offset,
+            self._layout.first_cluster_offset,
+            self._file_size,
+            n_workers,
+        )
+
+        if len(ranges) <= 1:
+            with _open_for_sparse_read(self.path) as src:
+                return self._scan_blocks(src, wanted)
+
+        # Submit parallel scan tasks — each opens its own fd.
+        all_plans: List[Tuple[int, List[BlockPlan]]] = []
+        with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+            futures = {}
+            for idx, (start, end) in enumerate(ranges):
+                fut = pool.submit(_scan_block_range, self.path, start, end, wanted)
+                futures[fut] = idx
+
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                all_plans.append((idx, fut.result()))
+
+        # Concatenate in range order (each sub-list is already in file-offset order).
+        all_plans.sort(key=lambda x: x[0])
+        merged: List[BlockPlan] = []
+        for _, sub_plan in all_plans:
+            merged.extend(sub_plan)
+        return merged
 
     @staticmethod
     def _merge_regions(

@@ -113,6 +113,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         format=fmt,
         progress_callback=cb,
         strategy=args.strategy,
+        scan_workers=args.workers,
     )
 
     elapsed = time.monotonic() - start_time
@@ -165,6 +166,13 @@ def main() -> None:
         help="Extraction strategy: auto (batched for >1 GB, single-pass otherwise), "
              "batched (two-phase scan+fetch, optimized for NFS), "
              "single-pass (original interleaved read/skip). Default: auto.",
+    )
+    ext_p.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Number of parallel Phase 1 scan workers (0=auto, 1=single-threaded). "
+             "Default: auto (4 for batched strategy).",
     )
 
     args = parser.parse_args()

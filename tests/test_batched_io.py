@@ -25,6 +25,7 @@ from fast_mkv_parser.extractor import (
     ReadRegion,
     MkvParser,
     _split_region,
+    _scan_block_range,
     _MAX_REGION_READ,
 )
 
@@ -92,15 +93,51 @@ def _make_cluster(timestamp: int, blocks: list) -> bytes:
     return encode_element_id(mkv.CLUSTER) + encode_element_size(len(body)) + body
 
 
+def _make_cue_point(time: int, track: int, cluster_position: int) -> bytes:
+    """Build a CuePoint element."""
+    # CueTrackPositions
+    tp_body = (
+        _make_uint_element(mkv.CUE_TRACK, track)
+        + _make_uint_element(mkv.CUE_CLUSTER_POSITION, cluster_position)
+    )
+    tp_elem = (
+        encode_element_id(mkv.CUE_TRACK_POSITIONS)
+        + encode_element_size(len(tp_body))
+        + tp_body
+    )
+    # CuePoint
+    cp_body = _make_uint_element(mkv.CUE_TIME, time) + tp_elem
+    return (
+        encode_element_id(mkv.CUE_POINT)
+        + encode_element_size(len(cp_body))
+        + cp_body
+    )
+
+
+def _make_cues_element(cue_points: list) -> bytes:
+    """Build a Cues element from a list of (time, track, cluster_position) tuples."""
+    body = b""
+    for time, track, cluster_pos in cue_points:
+        body += _make_cue_point(time, track, cluster_pos)
+    return (
+        encode_element_id(mkv.CUES)
+        + encode_element_size(len(body))
+        + body
+    )
+
+
 def _make_minimal_mkv(
     tracks: list,
     clusters_bytes: bytes,
     timecode_scale: int = 1_000_000,
+    cues: list = None,
 ) -> bytes:
     """Build a minimal MKV file with EBML Header + Segment.
 
     *tracks* is a list of (number, type_id, codec_id) tuples.
     *clusters_bytes* is pre-built Cluster element bytes.
+    *cues* is an optional list of (time, track, cluster_position) tuples.
+    cluster_position values are relative to the start of the Segment body.
     """
     # EBML Header
     ebml_body = b""
@@ -140,8 +177,11 @@ def _make_minimal_mkv(
         + tracks_body
     )
 
+    # Cues (optional, placed before clusters)
+    cues_elem = _make_cues_element(cues) if cues else b""
+
     # Segment (unknown size)
-    segment_payload = seg_info + tracks_elem + clusters_bytes
+    segment_payload = seg_info + tracks_elem + cues_elem + clusters_bytes
     segment = (
         encode_element_id(mkv.SEGMENT)
         + encode_element_size(UNKNOWN_SIZE, width=8)
@@ -599,3 +639,342 @@ class TestScanBlocks:
             assert bp.size > bp.hdr_size  # has payload beyond header
         finally:
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Tests: _build_scan_ranges
+# ---------------------------------------------------------------------------
+
+class TestBuildScanRanges:
+    """Test Cue-based range partitioning for parallel scanning."""
+
+    def test_many_cues_produces_n_ranges(self):
+        """With many evenly-spaced cues, should produce n_workers ranges."""
+        # Simulate cues at every 1000 bytes, segment starts at offset 100.
+        cues = [
+            mkv.CueEntry(time=i, track=1, cluster_position=i * 1000)
+            for i in range(20)
+        ]
+        ranges = MkvParser._build_scan_ranges(
+            cues,
+            segment_data_offset=100,
+            first_cluster_offset=100,
+            file_size=20100,
+            n_workers=4,
+        )
+        assert len(ranges) == 4
+        # Ranges should cover the full span.
+        assert ranges[0][0] == 100
+        assert ranges[-1][1] == 20100
+        # Ranges should be non-overlapping and contiguous.
+        for i in range(len(ranges) - 1):
+            assert ranges[i][1] == ranges[i + 1][0]
+
+    def test_fewer_cues_than_workers(self):
+        """With fewer cues than workers, should produce fewer ranges."""
+        cues = [
+            mkv.CueEntry(time=0, track=1, cluster_position=0),
+            mkv.CueEntry(time=1000, track=1, cluster_position=5000),
+        ]
+        ranges = MkvParser._build_scan_ranges(
+            cues,
+            segment_data_offset=100,
+            first_cluster_offset=100,
+            file_size=10000,
+            n_workers=8,
+        )
+        assert len(ranges) == 2
+        assert ranges[0][0] == 100
+        assert ranges[-1][1] == 10000
+
+    def test_single_cue_returns_single_range(self):
+        """A single cue point can't be split — return one range."""
+        cues = [mkv.CueEntry(time=0, track=1, cluster_position=0)]
+        ranges = MkvParser._build_scan_ranges(
+            cues,
+            segment_data_offset=100,
+            first_cluster_offset=100,
+            file_size=50000,
+            n_workers=4,
+        )
+        assert len(ranges) == 1
+        assert ranges[0] == (100, 50000)
+
+    def test_empty_cues_returns_single_range(self):
+        """No cues — return single range covering whole cluster region."""
+        ranges = MkvParser._build_scan_ranges(
+            cues=[],
+            segment_data_offset=100,
+            first_cluster_offset=100,
+            file_size=50000,
+            n_workers=4,
+        )
+        assert len(ranges) == 1
+        assert ranges[0] == (100, 50000)
+
+    def test_duplicate_cluster_positions_deduplicated(self):
+        """Cues with duplicate cluster_position should be deduplicated."""
+        cues = [
+            mkv.CueEntry(time=0, track=1, cluster_position=0),
+            mkv.CueEntry(time=0, track=2, cluster_position=0),  # same pos
+            mkv.CueEntry(time=1000, track=1, cluster_position=5000),
+            mkv.CueEntry(time=1000, track=2, cluster_position=5000),  # same
+            mkv.CueEntry(time=2000, track=1, cluster_position=10000),
+        ]
+        ranges = MkvParser._build_scan_ranges(
+            cues,
+            segment_data_offset=100,
+            first_cluster_offset=100,
+            file_size=20000,
+            n_workers=3,
+        )
+        # 3 unique offsets, 3 workers — should get 3 ranges.
+        assert len(ranges) == 3
+        assert ranges[0][0] == 100
+        assert ranges[-1][1] == 20000
+
+    def test_n_workers_1_returns_single_range(self):
+        """n_workers=1 should always return a single range."""
+        cues = [
+            mkv.CueEntry(time=i, track=1, cluster_position=i * 1000)
+            for i in range(20)
+        ]
+        ranges = MkvParser._build_scan_ranges(
+            cues,
+            segment_data_offset=100,
+            first_cluster_offset=100,
+            file_size=20100,
+            n_workers=1,
+        )
+        assert len(ranges) == 1
+        assert ranges[0] == (100, 20100)
+
+
+# ---------------------------------------------------------------------------
+# Tests: parallel scan correctness
+# ---------------------------------------------------------------------------
+
+class TestParallelScan:
+    """Verify _scan_blocks_parallel produces identical results to _scan_blocks."""
+
+    def _build_mkv_and_inject_cues(self):
+        """Build a synthetic MKV, scan for real cluster offsets, inject Cues.
+
+        Returns (src_path, parser) with parser._cues populated with correct
+        CueEntry objects pointing to actual cluster positions.
+        """
+        from fast_mkv_parser.ebml import read_element_id, read_element_size
+
+        tracks_spec = [
+            (1, mkv.TRACK_TYPE_VIDEO, "V_MPEGH/ISO/HEVC"),
+            (2, mkv.TRACK_TYPE_AUDIO, "A_TRUEHD"),
+            (5, mkv.TRACK_TYPE_SUBTITLE, "S_HDMV/PGS"),
+        ]
+
+        # Build 10 clusters with mixed track types.
+        clusters = b""
+        for cluster_ts in range(0, 5000, 500):
+            blocks = []
+            # Video (track 1) — large payloads
+            for i in range(3):
+                payload = bytes(range(256)) * 2  # 512 bytes
+                sb = _make_simple_block(1, i * 40, 0x80, payload)
+                blocks.append((mkv.SIMPLE_BLOCK, sb))
+            # Audio (track 2)
+            for i in range(2):
+                payload = bytes([0xAA, 0xBB] * 10)
+                sb = _make_simple_block(2, i * 30, 0x80, payload)
+                blocks.append((mkv.SIMPLE_BLOCK, sb))
+            # Subtitle (track 5) as BlockGroup
+            sub_payload = bytes([0xDE, 0xAD, 0xBE, 0xEF])
+            bg = _make_block_group(5, 0, 0x00, sub_payload, duration=500)
+            blocks.append((mkv.BLOCK_GROUP, bg))
+            clusters += _make_cluster(cluster_ts, blocks)
+
+        mkv_data = _make_minimal_mkv(tracks_spec, clusters)
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        parser = MkvParser(src_path)
+
+        # Scan the file to find actual cluster byte offsets.
+        cues = []
+        with open(src_path, "rb") as f:
+            f.seek(parser._layout.first_cluster_offset)
+            while f.tell() < parser._file_size:
+                cluster_pos = f.tell()
+                try:
+                    eid, _ = read_element_id(f)
+                    esize, _ = read_element_size(f)
+                except EOFError:
+                    break
+                if eid == mkv.CLUSTER:
+                    body_start = f.tell()
+                    # Read ClusterTimestamp (first child).
+                    cid, _ = read_element_id(f)
+                    csize, _ = read_element_size(f)
+                    ts = mkv._read_uint(f, csize) if cid == mkv.CLUSTER_TIMESTAMP else 0
+                    rel_pos = cluster_pos - parser._layout.segment_data_offset
+                    cues.append(mkv.CueEntry(time=ts, track=1, cluster_position=rel_pos))
+                    # Skip to end of cluster.
+                    if esize != UNKNOWN_SIZE:
+                        f.seek(body_start + esize)
+                    else:
+                        break
+                else:
+                    if esize == UNKNOWN_SIZE:
+                        break
+                    f.seek(f.tell() + esize)
+
+        parser._cues = cues
+        return src_path, parser
+
+    def test_parallel_matches_single_threaded(self):
+        """Parallel scan with 2 workers should produce identical BlockPlan."""
+        src_path, parser = self._build_mkv_and_inject_cues()
+
+        try:
+            assert len(parser._cues) > 0, "Parser should have injected Cues"
+
+            # Single-threaded scan.
+            with open(src_path, "rb") as src:
+                plan_single = parser._scan_blocks(src, {2, 5})
+
+            # Parallel scan with 2 workers.
+            plan_parallel = parser._scan_blocks_parallel({2, 5}, n_workers=2)
+
+            # Must produce identical results.
+            assert len(plan_parallel) == len(plan_single)
+            for bp_s, bp_p in zip(plan_single, plan_parallel):
+                assert bp_s.file_offset == bp_p.file_offset
+                assert bp_s.size == bp_p.size
+                assert bp_s.track_number == bp_p.track_number
+                assert bp_s.cluster_ts == bp_p.cluster_ts
+                assert bp_s.rel_ts == bp_p.rel_ts
+                assert bp_s.flags == bp_p.flags
+                assert bp_s.hdr_size == bp_p.hdr_size
+                assert bp_s.is_simple_block == bp_p.is_simple_block
+        finally:
+            os.unlink(src_path)
+
+    def test_parallel_scan_all_tracks(self):
+        """Parallel scan for all tracks should match single-threaded."""
+        src_path, parser = self._build_mkv_and_inject_cues()
+
+        try:
+            with open(src_path, "rb") as src:
+                plan_single = parser._scan_blocks(src, {1, 2, 5})
+
+            plan_parallel = parser._scan_blocks_parallel({1, 2, 5}, n_workers=4)
+
+            assert len(plan_parallel) == len(plan_single)
+            for bp_s, bp_p in zip(plan_single, plan_parallel):
+                assert bp_s.file_offset == bp_p.file_offset
+                assert bp_s.size == bp_p.size
+                assert bp_s.track_number == bp_p.track_number
+                assert bp_s.cluster_ts == bp_p.cluster_ts
+        finally:
+            os.unlink(src_path)
+
+    def test_parallel_fallback_no_cues(self):
+        """Without Cues, parallel scan should fall back to single-threaded."""
+        # Build MKV without Cues.
+        clusters = b""
+        for cluster_ts in range(0, 2000, 1000):
+            blocks = [
+                (mkv.SIMPLE_BLOCK, _make_simple_block(2, 0, 0x80, b"\xAA" * 20)),
+            ]
+            clusters += _make_cluster(cluster_ts, blocks)
+
+        tracks = [(2, mkv.TRACK_TYPE_AUDIO, "A_TRUEHD")]
+        mkv_data = _make_minimal_mkv(tracks, clusters)
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+            assert len(parser._cues) == 0
+
+            with open(src_path, "rb") as src:
+                plan_single = parser._scan_blocks(src, {2})
+
+            plan_parallel = parser._scan_blocks_parallel({2}, n_workers=4)
+
+            assert len(plan_parallel) == len(plan_single)
+            for bp_s, bp_p in zip(plan_single, plan_parallel):
+                assert bp_s.file_offset == bp_p.file_offset
+                assert bp_s.size == bp_p.size
+        finally:
+            os.unlink(src_path)
+
+    def test_batched_extraction_with_workers(self):
+        """Batched extraction with scan_workers=2 should produce byte-identical output."""
+        src_path, parser = self._build_mkv_and_inject_cues()
+
+        try:
+            # Single-pass extraction (baseline).
+            with tempfile.NamedTemporaryFile(suffix=".mka", delete=False) as f:
+                single_path = f.name
+            parser.extract(
+                track_types=["audio"],
+                output=single_path,
+                format="mkv",
+                strategy="single-pass",
+            )
+
+            # Batched with parallel scan.
+            with tempfile.NamedTemporaryFile(suffix=".mka", delete=False) as f:
+                parallel_path = f.name
+            parser.extract(
+                track_types=["audio"],
+                output=parallel_path,
+                format="mkv",
+                strategy="batched",
+                scan_workers=2,
+            )
+
+            with open(single_path, "rb") as a, open(parallel_path, "rb") as b:
+                single_data = a.read()
+                parallel_data = b.read()
+
+            assert len(single_data) > 0
+            assert single_data == parallel_data
+        finally:
+            os.unlink(src_path)
+            os.unlink(single_path)
+            os.unlink(parallel_path)
+
+    def test_sup_extraction_with_workers(self):
+        """SUP extraction with parallel scan should match single-pass."""
+        src_path, parser = self._build_mkv_and_inject_cues()
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".sup", delete=False) as f:
+                single_path = f.name
+            parser.extract(
+                track_types=["subtitle"],
+                output=single_path,
+                format="sup",
+                strategy="single-pass",
+            )
+
+            with tempfile.NamedTemporaryFile(suffix=".sup", delete=False) as f:
+                parallel_path = f.name
+            parser.extract(
+                track_types=["subtitle"],
+                output=parallel_path,
+                format="sup",
+                strategy="batched",
+                scan_workers=2,
+            )
+
+            with open(single_path, "rb") as a, open(parallel_path, "rb") as b:
+                assert a.read() == b.read()
+        finally:
+            os.unlink(src_path)
+            os.unlink(single_path)
+            os.unlink(parallel_path)
