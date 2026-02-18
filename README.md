@@ -43,6 +43,39 @@ Benchmarks on an 80 GB UHD MKV over NFS on a 1 Gbps LAN:
 
 On local storage (SSD/NVMe), the improvement is smaller since local I/O is fast regardless, but sparse reading still reduces unnecessary wear and memory pressure.
 
+### Extraction Strategies
+
+For files >1 GB, the default `auto` strategy uses **two-phase batched extraction**:
+
+1. **Phase 1 (scan)**: Parallel threads walk the file's Cluster headers, recording the offset and size of every wanted block. Each thread opens its own file descriptor with `FADV_RANDOM` to avoid read-ahead waste. Cue-based range partitioning ensures threads scan non-overlapping byte ranges.
+2. **Phase 2 (fetch)**: A single thread reads the wanted block payloads sequentially, merging adjacent blocks into contiguous reads to minimize NFS round trips.
+
+For files ≤1 GB, the simpler single-pass strategy is used (interleaved read/skip in one pass).
+
+### NFS Tuning
+
+Two parameters significantly affect NFS extraction speed: **Python I/O buffer size** and **parallel scan workers**. Both are tunable via the CLI (`--workers`) and library API (`scan_workers`).
+
+**Buffer size** (compile-time, default 32 KB): Controls the Python `buffering` parameter on file descriptors, which determines how much data each NFS READ RPC fetches. A larger buffer batches multiple EBML element reads into fewer NFS round trips. Measured impact on a Synology NAS over 1 Gbps LAN:
+
+| Buffer | Phase 1 kB/op | Phase 1 MB/s | Phase 2 MB/s |
+|--------|--------------|-------------|-------------|
+| 8 KB | ~12 | ~26 | ~10 |
+| 32 KB | ~36 | ~60–70 | ~23 |
+
+The 8 KB→32 KB jump is large because it captures the typical EBML read sequence (cluster header + timestamp + block header ≈ 26 bytes) in a single NFS RPC instead of 2–3. Going to 64 KB shows diminishing returns: Phase 1 seeks past video payloads (50 KB–2 MB) after each header peek, invalidating the buffer regardless of size.
+
+**Worker count** (default 8 for batched strategy): Controls Phase 1 parallelism. More workers issue concurrent NFS RPCs (the GIL is released during I/O), but push up NFS server RTT as the disk queue depth increases:
+
+| Workers | RTT | Phase 1 ops/s | Phase 1 MB/s |
+|---------|-----|--------------|-------------|
+| 4 | 2.4 ms | 1,645 | ~59 |
+| 8 | 3.9 ms | 1,950 | ~70 |
+
+8 workers is ~19% faster than 4 despite doubling RTT, because the additional concurrency more than compensates. Beyond 8, the NAS disk queue saturates with diminishing returns (~5–10% estimated for 16 workers). The optimal value depends on your NFS server's storage backend — SSDs tolerate more workers than spinning disks.
+
+Phase 2 (payload fetch) is always single-threaded since it reads large contiguous regions where bandwidth, not latency, is the bottleneck.
+
 ## Installation
 
 ```bash
@@ -101,6 +134,19 @@ fast-mkv-parser extract media.mkv -t subtitle -f sup -o subs.sup
 
 The SUP output is compatible with any tool that reads Blu-ray PGS subtitle files (e.g. BDSup2Sub, Tesseract-based OCR pipelines).
 
+### Extraction strategy and worker count
+
+```bash
+# Force two-phase batched extraction (default for >1 GB files)
+fast-mkv-parser extract media.mkv -t audio -o audio.mka --strategy batched --progress
+
+# Override parallel scan workers (default: 8)
+fast-mkv-parser extract media.mkv -t audio -o audio.mka --workers 4 --progress
+
+# Single-threaded single-pass (no parallel scan)
+fast-mkv-parser extract media.mkv -t audio -o audio.mka --strategy single-pass --progress
+```
+
 ### Default behavior
 
 If no `-t` or `--track-numbers` is specified, all non-video tracks are extracted.
@@ -124,6 +170,9 @@ def on_progress(bytes_done, total_bytes):
     print(f"{bytes_done / total_bytes * 100:.1f}%")
 
 parser.extract(track_types=["audio"], output="audio.mka", progress_callback=on_progress)
+
+# Override scan workers (default: 8 for batched, 1 for single-pass)
+parser.extract(track_types=["audio"], output="audio.mka", scan_workers=4)
 
 # Convenience methods
 parser.extract_audio("audio.mka")

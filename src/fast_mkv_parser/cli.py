@@ -172,7 +172,7 @@ def main() -> None:
         type=int,
         default=0,
         help="Number of parallel Phase 1 scan workers (0=auto, 1=single-threaded). "
-             "Default: auto (4 for batched strategy).",
+             "Default: auto (8 for batched strategy).",
     )
 
     args = parser.parse_args()

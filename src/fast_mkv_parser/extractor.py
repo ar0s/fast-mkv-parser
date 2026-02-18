@@ -74,7 +74,7 @@ def _open_for_sparse_read(path: str) -> BinaryIO:
             os.posix_fadvise(fd, 0, 0, _FADV_RANDOM)
         except OSError:
             pass  # Not all filesystems support fadvise; proceed anyway.
-    return os.fdopen(fd, "rb", buffering=8192)
+    return os.fdopen(fd, "rb", buffering=32768)
 
 
 def _split_region(
@@ -141,7 +141,7 @@ def _scan_block_range(
             os.posix_fadvise(fd, start_offset, length, _FADV_RANDOM)
         except OSError:
             pass
-    src = os.fdopen(fd, "rb", buffering=8192)
+    src = os.fdopen(fd, "rb", buffering=32768)
     try:
         src.seek(start_offset)
 
@@ -337,7 +337,7 @@ class MkvParser:
         # Resolve worker count.
         workers = scan_workers
         if workers == 0:
-            workers = 4 if use_batched else 1
+            workers = 8 if use_batched else 1
 
         with open(output, "wb") as dst:
             if format == "sup":
