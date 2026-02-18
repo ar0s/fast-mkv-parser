@@ -383,6 +383,9 @@ class MkvParser:
     def _parse_header(self, f: BinaryIO) -> None:
         """Parse EBML Header, then locate and parse Segment children:
         SegmentInfo, Tracks, and optionally Cues.
+
+        If Cues are not found before the first Cluster, follows the SeekHead
+        pointer to locate and parse Cues at end-of-file.
         """
         # --- EBML Header ---
         start = f.tell()
@@ -407,6 +410,7 @@ class MkvParser:
         # Stop at the first Cluster (we don't need to read beyond that for init).
         found_info = False
         found_tracks = False
+        cues_seek_position: Optional[int] = None  # From SeekHead, if Cues not inline
 
         while f.tell() < self._file_size:
             child_pos = f.tell()
@@ -439,13 +443,19 @@ class MkvParser:
                 self._layout.cues_size = child_size
                 self._cues = mkv.parse_cues(f, child_size)
 
+            elif child_id == mkv.SEEK_HEAD:
+                # Parse SeekHead to find Cues offset (in case Cues are at EOF).
+                pos = self._parse_seekhead_for_cues(f, child_size)
+                if pos is not None:
+                    cues_seek_position = pos
+
             elif child_id == mkv.CLUSTER:
                 # First Cluster found — record offset and stop scanning.
                 self._layout.first_cluster_offset = child_pos
                 break
 
             else:
-                # Skip SeekHead, Chapters, Tags, Attachments, etc.
+                # Skip Chapters, Tags, Attachments, etc.
                 if child_size == UNKNOWN_SIZE:
                     break
                 f.seek(body_pos + child_size)
@@ -458,6 +468,67 @@ class MkvParser:
             raise ValueError("MKV file has no Tracks element")
         if not found_info:
             self._segment_info = {"timecode_scale": 1_000_000}
+
+        # If Cues were not found inline, follow the SeekHead pointer.
+        if not self._cues and cues_seek_position is not None:
+            abs_offset = self._layout.segment_data_offset + cues_seek_position
+            if abs_offset < self._file_size:
+                f.seek(abs_offset)
+                try:
+                    cid, _ = read_element_id(f)
+                    csize, _ = read_element_size(f)
+                    if cid == mkv.CUES:
+                        self._layout.cues_offset = abs_offset
+                        self._layout.cues_size = csize
+                        self._cues = mkv.parse_cues(f, csize)
+                except (EOFError, ValueError):
+                    pass  # Corrupted or truncated — proceed without Cues.
+
+    @staticmethod
+    def _parse_seekhead_for_cues(f: BinaryIO, seekhead_size: int) -> Optional[int]:
+        """Parse a SeekHead element, returning the Cues seek position if found.
+
+        Returns the Cues position relative to Segment data start, or None.
+        """
+        end = f.tell() + seekhead_size
+        cues_id_bytes = encode_element_id(mkv.CUES)
+
+        while f.tell() < end:
+            try:
+                eid, _ = read_element_id(f)
+                esize, _ = read_element_size(f)
+            except EOFError:
+                break
+
+            if eid != mkv.SEEK:
+                if esize == UNKNOWN_SIZE:
+                    break
+                f.seek(esize, 1)
+                continue
+
+            # Parse Seek entry children: SeekID + SeekPosition.
+            seek_end = f.tell() + esize
+            seek_id_val: Optional[bytes] = None
+            seek_pos: Optional[int] = None
+
+            while f.tell() < seek_end:
+                try:
+                    seid, _ = read_element_id(f)
+                    sesize, _ = read_element_size(f)
+                except EOFError:
+                    break
+
+                if seid == mkv.SEEK_ID:
+                    seek_id_val = f.read(sesize)
+                elif seid == mkv.SEEK_POSITION:
+                    seek_pos = mkv._read_uint(f, sesize)
+                else:
+                    f.seek(sesize, 1)
+
+            if seek_id_val == cues_id_bytes and seek_pos is not None:
+                return seek_pos
+
+        return None
 
     # ------------------------------------------------------------------
     # Cluster walking (sparse extraction core)

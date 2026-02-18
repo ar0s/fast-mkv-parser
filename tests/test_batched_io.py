@@ -126,6 +126,26 @@ def _make_cues_element(cue_points: list) -> bytes:
     )
 
 
+def _make_seek_entry(seek_id: int, seek_position: int) -> bytes:
+    """Build a Seek element (child of SeekHead)."""
+    id_bytes = encode_element_id(seek_id)
+    body = (
+        encode_element_id(mkv.SEEK_ID)
+        + encode_element_size(len(id_bytes))
+        + id_bytes
+        + _make_uint_element(mkv.SEEK_POSITION, seek_position)
+    )
+    return encode_element_id(mkv.SEEK) + encode_element_size(len(body)) + body
+
+
+def _make_seekhead(entries: list) -> bytes:
+    """Build a SeekHead element from (element_id, seek_position) tuples."""
+    body = b""
+    for eid, pos in entries:
+        body += _make_seek_entry(eid, pos)
+    return encode_element_id(mkv.SEEK_HEAD) + encode_element_size(len(body)) + body
+
+
 def _make_minimal_mkv(
     tracks: list,
     clusters_bytes: bytes,
@@ -639,6 +659,195 @@ class TestScanBlocks:
             assert bp.size > bp.hdr_size  # has payload beyond header
         finally:
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Tests: SeekHead → Cues-at-EOF discovery
+# ---------------------------------------------------------------------------
+
+class TestSeekHeadCues:
+    """Verify Cues at end-of-file are found via SeekHead pointer."""
+
+    def _build_mkv_with_cues_at_eof(self):
+        """Build an MKV with SeekHead → Cues at end (typical mkvmerge layout).
+
+        Layout: EBML Header | Segment [ SeekHead | SegmentInfo | Tracks | Clusters | Cues ]
+        The SeekHead contains a pointer to the Cues position.
+        """
+        tracks_spec = [
+            (1, mkv.TRACK_TYPE_VIDEO, "V_MPEGH/ISO/HEVC"),
+            (2, mkv.TRACK_TYPE_AUDIO, "A_TRUEHD"),
+        ]
+
+        # Build clusters.
+        cluster_data_list = []
+        for cluster_ts in range(0, 3000, 500):
+            blocks = [
+                (mkv.SIMPLE_BLOCK, _make_simple_block(1, 0, 0x80, b"\x00" * 100)),
+                (mkv.SIMPLE_BLOCK, _make_simple_block(2, 0, 0x80, b"\xAA" * 20)),
+            ]
+            cluster_data_list.append((cluster_ts, _make_cluster(cluster_ts, blocks)))
+        clusters_bytes = b"".join(data for _, data in cluster_data_list)
+
+        # Build segment children WITHOUT SeekHead/Cues first to measure sizes.
+        seg_info_body = _make_uint_element(mkv.TIMECODE_SCALE, 1_000_000)
+        seg_info = (
+            encode_element_id(mkv.SEGMENT_INFO)
+            + encode_element_size(len(seg_info_body))
+            + seg_info_body
+        )
+        tracks_body = b""
+        for num, type_id, codec_id in tracks_spec:
+            entry_body = _make_track_entry_body(num, type_id, codec_id, uid=num * 1000)
+            tracks_body += (
+                encode_element_id(mkv.TRACK_ENTRY)
+                + encode_element_size(len(entry_body))
+                + entry_body
+            )
+        tracks_elem = (
+            encode_element_id(mkv.TRACKS)
+            + encode_element_size(len(tracks_body))
+            + tracks_body
+        )
+
+        # EBML Header (fixed).
+        ebml_body = b""
+        ebml_body += _make_uint_element(0x4286, 1)
+        ebml_body += _make_uint_element(0x42F7, 1)
+        ebml_body += _make_uint_element(0x42F2, 4)
+        ebml_body += _make_uint_element(0x42F3, 8)
+        ebml_body += _make_string_element(0x4282, "matroska")
+        ebml_body += _make_uint_element(0x4287, 4)
+        ebml_body += _make_uint_element(0x4285, 2)
+        ebml_header = (
+            encode_element_id(mkv.EBML_HEADER)
+            + encode_element_size(len(ebml_body))
+            + ebml_body
+        )
+
+        # Segment header: ID (4) + size VINT (8 for unknown-size).
+        segment_hdr = (
+            encode_element_id(mkv.SEGMENT)
+            + encode_element_size(UNKNOWN_SIZE, width=8)
+        )
+
+        # segment_data_offset = len(ebml_header) + len(segment_hdr)
+        segment_data_offset = len(ebml_header) + len(segment_hdr)
+
+        # Build SeekHead with placeholder Cues position (iterate to stabilize).
+        # Cues position = len(seekhead) + len(seg_info) + len(tracks_elem) + len(clusters)
+        # But seekhead size depends on the Cues position value encoding...
+        # Use 2-pass: estimate seekhead size, then compute exact.
+        approx_seekhead = _make_seekhead([(mkv.CUES, 99999)])
+        seekhead_size = len(approx_seekhead)
+
+        cues_pos_rel = seekhead_size + len(seg_info) + len(tracks_elem) + len(clusters_bytes)
+
+        # Rebuild seekhead with correct position.
+        seekhead = _make_seekhead([(mkv.CUES, cues_pos_rel)])
+        # If size changed, iterate once more.
+        if len(seekhead) != seekhead_size:
+            seekhead_size = len(seekhead)
+            cues_pos_rel = seekhead_size + len(seg_info) + len(tracks_elem) + len(clusters_bytes)
+            seekhead = _make_seekhead([(mkv.CUES, cues_pos_rel)])
+
+        # Build Cues with correct cluster positions.
+        cue_tuples = []
+        cluster_offset_in_segment = seekhead_size + len(seg_info) + len(tracks_elem)
+        pos = 0
+        for cluster_ts, data in cluster_data_list:
+            cue_tuples.append((cluster_ts, 1, cluster_offset_in_segment + pos))
+            pos += len(data)
+        cues_elem = _make_cues_element(cue_tuples)
+
+        # Assemble: SeekHead | SegmentInfo | Tracks | Clusters | Cues
+        segment_payload = seekhead + seg_info + tracks_elem + clusters_bytes + cues_elem
+        mkv_data = ebml_header + segment_hdr + segment_payload
+        return mkv_data, len(cue_tuples)
+
+    def test_cues_found_via_seekhead(self):
+        """Parser should find Cues at EOF by following SeekHead pointer."""
+        mkv_data, expected_cue_count = self._build_mkv_with_cues_at_eof()
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+            assert len(parser._cues) == expected_cue_count, (
+                f"Expected {expected_cue_count} cues, found {len(parser._cues)}"
+            )
+            # Verify cue timestamps are sensible.
+            times = [c.time for c in parser._cues]
+            assert times == sorted(times)
+            assert times[0] == 0
+        finally:
+            os.unlink(src_path)
+
+    def test_parallel_scan_with_eof_cues(self):
+        """Parallel scan should work when Cues are discovered via SeekHead."""
+        mkv_data, _ = self._build_mkv_with_cues_at_eof()
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+            assert len(parser._cues) > 0
+
+            # Single-threaded baseline.
+            with open(src_path, "rb") as src:
+                plan_single = parser._scan_blocks(src, {2})
+
+            # Parallel scan.
+            plan_parallel = parser._scan_blocks_parallel({2}, n_workers=2)
+
+            assert len(plan_parallel) == len(plan_single)
+            for bp_s, bp_p in zip(plan_single, plan_parallel):
+                assert bp_s.file_offset == bp_p.file_offset
+                assert bp_s.size == bp_p.size
+                assert bp_s.track_number == bp_p.track_number
+                assert bp_s.cluster_ts == bp_p.cluster_ts
+        finally:
+            os.unlink(src_path)
+
+    def test_extraction_identical_with_eof_cues(self):
+        """Batched extraction with EOF Cues should match single-pass."""
+        mkv_data, _ = self._build_mkv_with_cues_at_eof()
+
+        with tempfile.NamedTemporaryFile(suffix=".mkv", delete=False) as f:
+            f.write(mkv_data)
+            src_path = f.name
+
+        try:
+            parser = MkvParser(src_path)
+
+            with tempfile.NamedTemporaryFile(suffix=".mka", delete=False) as f:
+                single_path = f.name
+            parser.extract(
+                track_types=["audio"], output=single_path,
+                format="mkv", strategy="single-pass",
+            )
+
+            with tempfile.NamedTemporaryFile(suffix=".mka", delete=False) as f:
+                parallel_path = f.name
+            parser.extract(
+                track_types=["audio"], output=parallel_path,
+                format="mkv", strategy="batched", scan_workers=2,
+            )
+
+            with open(single_path, "rb") as a, open(parallel_path, "rb") as b:
+                single_data = a.read()
+                parallel_data = b.read()
+
+            assert len(single_data) > 0
+            assert single_data == parallel_data
+        finally:
+            os.unlink(src_path)
+            os.unlink(single_path)
+            os.unlink(parallel_path)
 
 
 # ---------------------------------------------------------------------------
